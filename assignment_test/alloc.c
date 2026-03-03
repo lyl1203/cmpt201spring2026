@@ -1,0 +1,192 @@
+#define _DEFAULT_SOURCE
+
+#include "alloc.h"
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define HEADER_SIZE (sizeof(struct header))
+
+static struct header *main_head = NULL;
+static enum algs current_algorithm = FIRST_FIT;
+static int limit_size = 0;
+static char *initial_heap = NULL;
+static int current_heap_size = 0;
+
+void allocopt(enum algs algorithm, int limit) {
+  current_algorithm = algorithm;
+  limit_size = limit;
+  main_head = NULL;
+  current_heap_size = 0;
+  // allocate/reset the initial address of heap break
+  if (initial_heap == NULL) {
+    initial_heap = sbrk(0);
+  } else {
+    brk(initial_heap);
+  }
+}
+
+// return the ptr to the next pointer that pointing to the block we want
+static struct header **ptr_to_block(uint64_t required_size) {
+  struct header **best_fit = NULL;
+  uint64_t best_block_size = UINT64_MAX;
+  struct header **worst_fit = NULL;
+  uint64_t worst_block_size = 0;
+  struct header **temp = &main_head;
+  while (*temp != NULL) {
+    // if found block size >= required size, mark this block
+    if ((*temp)->size >= required_size) {
+      if (current_algorithm == FIRST_FIT) {
+        // return immediately for the first available block
+        return temp;
+      } else if (current_algorithm == BEST_FIT) {
+        // update ptr if found smaller available block
+        if ((*temp)->size < best_block_size) {
+          best_fit = temp;
+          best_block_size = (*temp)->size;
+        }
+      } else if (current_algorithm == WORST_FIT) {
+        if ((*temp)->size > worst_block_size) {
+          worst_fit = temp;
+          worst_block_size = (*temp)->size;
+        }
+      }
+    }
+    temp = &((*temp)->next);
+  }
+  if (current_algorithm == BEST_FIT) {
+    return best_fit;
+  }
+  if (current_algorithm == WORST_FIT) {
+    return worst_fit;
+  }
+  // if didn't find any available block, alloc() should call increase_heap()
+  return NULL;
+}
+
+// increase heap size by calling sbrk(INCREMENT)
+static bool increase_heap(void) {
+  if (limit_size > 0 && current_heap_size + INCREMENT > limit_size) {
+    return false;
+  }
+  // if not yet touch the limit, call sbrk()
+  char *new_heap_break = sbrk(INCREMENT);
+  if (new_heap_break == (void *)-1) {
+    return false;
+  }
+  struct header *new_main_head = (struct header *)new_heap_break;
+  new_main_head->size = INCREMENT;
+  new_main_head->next = main_head;
+  main_head = new_main_head;
+  current_heap_size += INCREMENT;
+  return true;
+}
+
+void *alloc(int required_size) {
+  if (required_size <= 0)
+    return NULL;
+
+  uint64_t total_required_size =
+      (uint64_t)required_size + (uint64_t)HEADER_SIZE;
+  struct header **target_block_ptr = ptr_to_block(total_required_size);
+  // if main_head == NULL, i.e. first call alloc(), target_block_ptr will be
+  // NULL and call increase_heap() for heap space
+  while (target_block_ptr == NULL) {
+    if (increase_heap() == false) {
+      return NULL;
+    }
+    // keep expanding heap until satisfy required size
+    target_block_ptr = ptr_to_block(total_required_size);
+  }
+
+  // next split the allocated block into used part and free part
+  struct header *current_block = *target_block_ptr;
+  uint64_t remain_space = current_block->size - total_required_size;
+  // use double pointer to handle the linked list node removal
+  if (remain_space > (uint64_t)HEADER_SIZE) {
+    // split only if remaining space > header size
+    struct header *new_free_block =
+        (struct header *)((char *)current_block + total_required_size);
+    new_free_block->size = remain_space;
+    new_free_block->next = current_block->next;
+    current_block->size = total_required_size;
+    *target_block_ptr = new_free_block;
+  } else {
+    // if remaining space <= header size, no point to split
+    *target_block_ptr = current_block->next;
+  }
+  // lastly, return the address right after the header
+  return (void *)((char *)current_block + HEADER_SIZE);
+}
+
+struct allocinfo allocinfo(void) {
+  struct allocinfo current_info = {0, 0, 0, 0};
+  uint64_t largest_size = 0;
+  uint64_t smallest_size = INT64_MAX;
+
+  for (struct header *temp = main_head; temp != NULL; temp = temp->next) {
+    uint64_t alloc_size = temp->size - (uint64_t)HEADER_SIZE;
+    current_info.free_chunks += 1;
+    current_info.free_size += alloc_size;
+    if (largest_size < temp->size) {
+      largest_size = temp->size;
+    }
+    if (smallest_size > temp->size) {
+      smallest_size = temp->size;
+    }
+  }
+  current_info.largest_free_chunk_size = largest_size;
+  current_info.smallest_free_chunk_size = smallest_size;
+  return current_info;
+}
+
+static void coalesce(void) {
+  bool need_coalesce = true;
+  while (need_coalesce) {
+    need_coalesce = false;
+    // traverse the list, find if any free neighbour after this node
+    for (struct header **block_before_ptr = &main_head;
+         *block_before_ptr != NULL;
+         block_before_ptr = &((*block_before_ptr)->next)) {
+      struct header *block_before = *block_before_ptr;
+      char *block_before_end = (char *)block_before + block_before->size;
+
+      for (struct header **block_after_ptr = &main_head;
+           *block_after_ptr != NULL;
+           block_after_ptr = &((*block_after_ptr)->next)) {
+        struct header *block_after = *block_after_ptr;
+        if (block_after == block_before) {
+          continue;
+        }
+        // if one's end is another one's start, they must be neighbouring
+        if ((char *)block_after == block_before_end) {
+          block_before->size += block_after->size + (uint64_t)HEADER_SIZE;
+          *block_after_ptr = block_after->next;
+          // i.e. merge block_after to block_before, keep all the pointer relate
+          // to block_before, and remove block_after, node pointing to
+          // block_after now point to block_after->next Then, back to the
+          // main_head, restart the traverse
+          need_coalesce = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+void dealloc(void *free_address) {
+  if (free_address == NULL) {
+    // nothing to deallocate
+    return;
+  }
+  // create the ptr of the header struct
+  struct header *free_block =
+      (struct header *)((char *)free_address - HEADER_SIZE);
+  free_block->next = main_head;
+  main_head = free_block;
+  coalesce();
+}
